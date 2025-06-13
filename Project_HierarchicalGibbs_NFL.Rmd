@@ -1,0 +1,381 @@
+---
+title: "Project-Bayesian Analysis(Spring 2025)"
+author: "Udayveer Singh Andotra"
+date: "2025-08-05"
+output: html_document
+---
+
+```{r}
+# Load required package for data handling and visualization
+library(tidyverse)
+
+# Define team abbreviation to full name mapping
+team_mapping <- data.frame(
+  abbreviation = c("ari", "atl", "bal", "buf", "car", "chi", "cin", "cle", "dal", "den", 
+                  "det", "gb", "hou", "ind", "jax", "kc", "lac", "la", "lv", "mia", 
+                  "min", "ne", "no", "nyg", "nyj", "phi", "pit", "sf", "sea", "tb", 
+                  "ten", "was"),
+  full_name = c("Arizona Cardinals", "Atlanta Falcons", "Baltimore Ravens", "Buffalo Bills", 
+                "Carolina Panthers", "Chicago Bears", "Cincinnati Bengals", "Cleveland Browns", 
+                "Dallas Cowboys", "Denver Broncos", "Detroit Lions", "Green Bay Packers", 
+                "Houston Texans", "Indianapolis Colts", "Jacksonville Jaguars", "Kansas City Chiefs", 
+                "Los Angeles Chargers", "Los Angeles Rams", "Las Vegas Raiders", "Miami Dolphins", 
+                "Minnesota Vikings", "New England Patriots", "New Orleans Saints", "New York Giants", 
+                "New York Jets", "Philadelphia Eagles", "Pittsburgh Steelers", "San Francisco 49ers", 
+                "Seattle Seahawks", "Tampa Bay Buccaneers", "Tennessee Titans", "Washington Commanders")
+)
+
+# Print and save team mapping
+cat("Team Abbreviation to Full Name Mapping:\n")
+print(team_mapping)
+write.csv(team_mapping, "team_mapping.csv", row.names = FALSE)
+
+# Load NFL 2024-2025 regular season data
+data <- read.csv("NFL_DataScrap(2024-2025).csv")
+
+# Normalize team names to lowercase for consistency
+data <- data %>% 
+  mutate(home_team = tolower(home_team), away_team = tolower(away_team))
+
+# Print unique team names for debugging
+cat("Unique team names in dataset:\n")
+print(sort(unique(c(data$home_team, data$away_team))))
+
+# Prepare team and week indices
+teams <- unique(c(data$home_team, data$away_team))
+n_teams <- length(teams)
+team_to_idx <- setNames(1:n_teams, teams)
+cat("Team to index mapping:\n")
+print(team_to_idx)
+
+# Assign indices to dataset
+data$home_idx <- team_to_idx[data$home_team]
+data$away_idx <- team_to_idx[data$away_team]
+if (any(is.na(data$home_idx) | is.na(data$away_idx))) {
+  stop("NA indices found in dataset. Check home_team and away_team for inconsistencies.")
+}
+weeks <- unique(data$week)
+n_weeks <- max(weeks)
+N <- nrow(data)
+
+# Define playoff games with team abbreviations (lowercase)
+playoff_games <- data.frame(
+  home_team = c("buf", "bal", "hou", "phi", "tb", "la"),
+  away_team = c("den", "pit", "lac", "gb", "was", "min")
+)
+
+# Add full team names for playoff games
+playoff_games <- playoff_games %>%
+  left_join(select(team_mapping, abbreviation, home_full_name = full_name), by = c("home_team" = "abbreviation")) %>%
+  left_join(select(team_mapping, abbreviation, away_full_name = full_name), by = c("away_team" = "abbreviation"))
+
+# Validate playoff team indices
+playoff_games$home_idx <- team_to_idx[playoff_games$home_team]
+playoff_games$away_idx <- team_to_idx[playoff_games$away_team]
+cat("Playoff games with indices:\n")
+print(playoff_games[, c("home_full_name", "away_full_name", "home_idx", "away_idx")])
+if (any(is.na(playoff_games$home_idx) | is.na(playoff_games$away_idx))) {
+  cat("Invalid team abbreviations in playoff_games:\n")
+  invalid_rows <- playoff_games[is.na(playoff_games$home_idx) | is.na(playoff_games$away_idx), ]
+  cat("Mismatched teams:\n")
+  print(invalid_rows[, c("home_team", "away_team")])
+  stop("Invalid team abbreviations in playoff_games. Check home_team and away_team against dataset team names above.")
+}
+
+# Initialize MCMC parameters
+set.seed(42)
+n_iter <- 5000
+burn_in <- 1000
+
+# Initialize parameters
+alpha <- matrix(0, n_teams, n_weeks)  # Team strength
+beta_home <- rep(0, n_teams)  # Home-field advantage
+gamma <- 0  # spread_line
+delta1 <- 0  # off_epa_per_play_h
+delta2 <- 0  # off_epa_per_play_a
+eta1 <- 0  # off_wpa_h
+eta2 <- 0  # off_wpa_a
+theta1 <- 0  # off_cpoe_h
+theta2 <- 0  # off_cpoe_a
+lambda1 <- 0  # home_points_scored_last_3
+lambda2 <- 0  # away_points_scored_last_3
+sigma_sq <- 1  # Variance
+phi <- 0.9  # Fixed AR(1) dependence
+
+# Store samples for week 18
+alpha_wk18_samples <- matrix(NA, n_iter, n_teams)
+beta_home_samples <- matrix(NA, n_iter, n_teams)
+gamma_samples <- numeric(n_iter)
+delta1_samples <- numeric(n_iter)
+delta2_samples <- numeric(n_iter)
+eta1_samples <- numeric(n_iter)
+eta2_samples <- numeric(n_iter)
+theta1_samples <- numeric(n_iter)
+theta2_samples <- numeric(n_iter)
+lambda1_samples <- numeric(n_iter)
+lambda2_samples <- numeric(n_iter)
+
+# MCMC loop
+for (iter in 1:n_iter) {
+  # Compute covariate adjustment
+  cov_adj <- (gamma * data$spread_line +
+              delta1 * data$off_epa_per_play_h +
+              delta2 * data$off_epa_per_play_a +
+              eta1 * data$off_wpa_h +
+              eta2 * data$off_wpa_a +
+              theta1 * data$off_cpoe_h +
+              theta2 * data$off_cpoe_a +
+              lambda1 * data$home_points_scored_last_3 +
+              lambda2 * data$away_points_scored_last_3)
+
+  # Update alpha_it
+  for (t in 1:n_weeks) {
+    for (i in 1:n_teams) {
+      games_h <- which(data$home_idx == i & data$week == t)
+      games_a <- which(data$away_idx == i & data$week == t)
+      n_games <- length(games_h) + length(games_a)
+      sum_term <- 0
+      if (length(games_h) > 0) {
+        sum_term <- sum_term + sum(data$point_diff[games_h] - (
+          -alpha[data$away_idx[games_h], t] + beta_home[i] + cov_adj[games_h]
+        ))
+      }
+      if (length(games_a) > 0) {
+        sum_term <- sum_term + sum(-data$point_diff[games_a] - (
+          alpha[data$home_idx[games_a], t] + beta_home[data$home_idx[games_a]] + cov_adj[games_a]
+        ))
+      }
+      var_new <- 1 / (max(n_games, 1) / sigma_sq + 1 / 1)
+      mean_new <- if (t == 1) {
+        (sum_term / sigma_sq) * var_new
+      } else {
+        (sum_term / sigma_sq + phi * alpha[i, t-1] / 1) * var_new
+      }
+      alpha[i, t] <- rnorm(1, mean_new, sqrt(var_new))
+      alpha[i, t] <- pmin(pmax(alpha[i, t], -50), 50)
+      if (!is.finite(alpha[i, t])) alpha[i, t] <- 0
+    }
+  }
+
+  # Update beta_home
+  for (i in 1:n_teams) {
+    games_h <- which(data$home_idx == i)
+    n_h <- length(games_h)
+    if (n_h > 0) {
+      sum_term <- sum(data$point_diff[games_h] - (
+        alpha[data$home_idx[games_h], data$week[games_h]] -
+        alpha[data$away_idx[games_h], data$week[games_h]] + cov_adj[games_h]
+      ))
+      var_new <- 1 / (n_h / sigma_sq + 1 / 4)
+      mean_new <- (sum_term / sigma_sq) * var_new
+      beta_home[i] <- rnorm(1, mean_new, sqrt(var_new))
+    } else {
+      beta_home[i] <- rnorm(1, 0, 2)
+    }
+    beta_home[i] <- pmin(pmax(beta_home[i], -50), 50)
+    if (!is.finite(beta_home[i])) beta_home[i] <- 0
+  }
+
+  # Update gamma (spread_line)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a +
+           theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$spread_line)
+  var_new <- 1 / (sum(data$spread_line^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  gamma <- rnorm(1, mean_new, sqrt(var_new))
+  gamma <- pmin(pmax(gamma, -10), 10)
+  if (!is.finite(gamma)) gamma <- 0
+
+  # Update delta1 (off_epa_per_play_h)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a +
+           theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$off_epa_per_play_h)
+  var_new <- 1 / (sum(data$off_epa_per_play_h^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  delta1 <- rnorm(1, mean_new, sqrt(var_new))
+  delta1 <- pmin(pmax(delta1, -10), 10)
+  if (!is.finite(delta1)) delta1 <- 0
+
+  # Update delta2 (off_epa_per_play_a)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a +
+           theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$off_epa_per_play_a)
+  var_new <- 1 / (sum(data$off_epa_per_play_a^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  delta2 <- rnorm(1, mean_new, sqrt(var_new))
+  delta2 <- pmin(pmax(delta2, -10), 10)
+  if (!is.finite(delta2)) delta2 <- 0
+
+  # Update eta1 (off_wpa_h)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta2 * data$off_wpa_a + theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$off_wpa_h)
+  var_new <- 1 / (sum(data$off_wpa_h^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  eta1 <- rnorm(1, mean_new, sqrt(var_new))
+  eta1 <- pmin(pmax(eta1, -10), 10)
+  if (!is.finite(eta1)) eta1 <- 0
+
+  # Update eta2 (off_wpa_a)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$off_wpa_a)
+  var_new <- 1 / (sum(data$off_wpa_a^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  eta2 <- rnorm(1, mean_new, sqrt(var_new))
+  eta2 <- pmin(pmax(eta2, -10), 10)
+  if (!is.finite(eta2)) eta2 <- 0
+
+  # Update theta1 (off_cpoe_h)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$off_cpoe_h)
+  var_new <- 1 / (sum(data$off_cpoe_h^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  theta1 <- rnorm(1, mean_new, sqrt(var_new))
+  theta1 <- pmin(pmax(theta1, -10), 10)
+  if (!is.finite(theta1)) theta1 <- 0
+
+  # Update theta2 (off_cpoe_a)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a + theta1 * data$off_cpoe_h +
+           lambda1 * data$home_points_scored_last_3 + lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$off_cpoe_a)
+  var_new <- 1 / (sum(data$off_cpoe_a^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  theta2 <- rnorm(1, mean_new, sqrt(var_new))
+  theta2 <- pmin(pmax(theta2, -10), 10)
+  if (!is.finite(theta2)) theta2 <- 0
+
+  # Update lambda1 (home_points_scored_last_3)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a +
+           theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda2 * data$away_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$home_points_scored_last_3)
+  var_new <- 1 / (sum(data$home_points_scored_last_3^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  lambda1 <- rnorm(1, mean_new, sqrt(var_new))
+  lambda1 <- pmin(pmax(lambda1, -10), 10)
+  if (!is.finite(lambda1)) lambda1 <- 0
+
+  # Update lambda2 (away_points_scored_last_3)
+  mu_g <- (alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] +
+           gamma * data$spread_line + delta1 * data$off_epa_per_play_h + delta2 * data$off_epa_per_play_a +
+           eta1 * data$off_wpa_h + eta2 * data$off_wpa_a +
+           theta1 * data$off_cpoe_h + theta2 * data$off_cpoe_a +
+           lambda1 * data$home_points_scored_last_3)
+  sum_term <- sum((data$point_diff - mu_g) * data$away_points_scored_last_3)
+  var_new <- 1 / (sum(data$away_points_scored_last_3^2) / sigma_sq + 1 / 4)
+  mean_new <- (sum_term / sigma_sq) * var_new
+  lambda2 <- rnorm(1, mean_new, sqrt(var_new))
+  lambda2 <- pmin(pmax(lambda2, -10), 10)
+  if (!is.finite(lambda2)) lambda2 <- 0
+
+  # Update sigma_sq
+  mu_g <- alpha[data$home_idx, data$week] - alpha[data$away_idx, data$week] + beta_home[data$home_idx] + cov_adj
+  shape_sigma <- 5 + N / 2
+  rate_sigma <- 5 + 0.5 * sum((data$point_diff - mu_g)^2)
+  sigma_sq <- 1 / rgamma(1, shape_sigma, rate_sigma)
+  if (!is.finite(sigma_sq) || sigma_sq <= 0.01) sigma_sq <- 0.01
+
+  # Store samples
+  alpha_wk18_samples[iter, ] <- alpha[, n_weeks]
+  beta_home_samples[iter, ] <- beta_home
+  gamma_samples[iter] <- gamma
+  delta1_samples[iter] <- delta1
+  delta2_samples[iter] <- delta2
+  eta1_samples[iter] <- eta1
+  eta2_samples[iter] <- eta2
+  theta1_samples[iter] <- theta1
+  theta2_samples[iter] <- theta2
+  lambda1_samples[iter] <- lambda1
+  lambda2_samples[iter] <- lambda2
+}
+
+# Summarize covariate coefficients
+covariate_summary <- data.frame(
+  Covariate = c("spread_line", "off_epa_per_play_h", "off_epa_per_play_a", 
+                "off_wpa_h", "off_wpa_a", "off_cpoe_h", "off_cpoe_a", 
+                "home_points_scored_last_3", "away_points_scored_last_3"),
+  Mean_Coefficient = c(mean(gamma_samples[-(1:burn_in)]), 
+                       mean(delta1_samples[-(1:burn_in)]), 
+                       mean(delta2_samples[-(1:burn_in)]), 
+                       mean(eta1_samples[-(1:burn_in)]), 
+                       mean(eta2_samples[-(1:burn_in)]), 
+                       mean(theta1_samples[-(1:burn_in)]), 
+                       mean(theta2_samples[-(1:burn_in)]), 
+                       mean(lambda1_samples[-(1:burn_in)]), 
+                       mean(lambda2_samples[-(1:burn_in)]))
+)
+cat("Covariate Coefficient Summary:\n")
+print(covariate_summary)
+write.csv(covariate_summary, "covariate_coefficients.csv", row.names = FALSE)
+
+# Playoff predictions
+n_samples <- n_iter - burn_in
+playoff_pred <- matrix(NA, n_samples, nrow(playoff_games))
+for (iter in (burn_in + 1):n_iter) {
+  for (g in 1:nrow(playoff_games)) {
+    mu_g <- alpha_wk18_samples[iter, playoff_games$home_idx[g]] -
+            alpha_wk18_samples[iter, playoff_games$away_idx[g]] +
+            beta_home_samples[iter, playoff_games$home_idx[g]]
+    sigma <- sqrt(sigma_sq)
+    if (is.finite(mu_g) && is.finite(sigma) && sigma > 0) {
+      playoff_pred[iter - burn_in, g] <- rnorm(1, mu_g, sigma)
+    } else {
+      playoff_pred[iter - burn_in, g] <- NA
+    }
+  }
+}
+
+# Debug NA predictions
+cat("Number of NA predictions:", sum(is.na(playoff_pred)), "\n")
+
+# Save prediction matrix
+saveRDS(playoff_pred, "playoff_pred.rds")
+
+# Summarize predictions with full team names
+playoff_results <- data.frame(
+  Game = paste(playoff_games$home_full_name, "vs", playoff_games$away_full_name),
+  Mean_point_diff = round(colMeans(playoff_pred, na.rm = TRUE), 2),
+  Home_Win_Prob = round(colMeans(playoff_pred > 0, na.rm = TRUE), 2)
+)
+cat("Playoff Game Predictions:\n")
+print(playoff_results)
+write.csv(playoff_results, "playoff_predictions.csv", row.names = FALSE)
+
+# Create violin plot with full team names
+plot_data <- data.frame(
+  point_diff = c(playoff_pred),
+  Game = rep(playoff_results$Game, each = n_samples)
+) %>% filter(is.finite(point_diff))
+if (nrow(plot_data) == 0) {
+  stop("No valid prediction data for plotting. Check playoff_pred for NA/Inf values.")
+}
+p <- ggplot(plot_data, aes(x = point_diff, y = Game, fill = Game)) +
+  geom_violin(alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Predicted Point Differentials for 2025 NFL Wild Card Games",
+       x = "Point Differential (Home - Away)", y = "Game") +
+  theme_minimal() +
+  theme(legend.position = "none")
+ggsave("playoff_predictions.png", plot = p, width = 8, height = 6)
+```
